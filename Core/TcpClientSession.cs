@@ -12,9 +12,7 @@ namespace SuperSocket.ClientEngine
     {
         protected string HostName { get; private set; }
 
-        private bool m_InConnecting = false;
-
-        public const int DefaultReceiveBufferSize = 4096;
+        private bool m_InConnecting = false;        
 
         public TcpClientSession()
             : base()
@@ -141,9 +139,9 @@ namespace SuperSocket.ClientEngine
         {
             if (e != null && e.SocketError != SocketError.Success)
             {
-                e.Dispose();
                 m_InConnecting = false;
                 OnError(new SocketException((int)e.SocketError));
+                e.Dispose();
                 return;
             }
 
@@ -177,11 +175,30 @@ namespace SuperSocket.ClientEngine
             m_InConnecting = false;
 
 #if !SILVERLIGHT
-            LocalEndPoint = socket.LocalEndPoint;
+            try
+            {
+                // mono may throw an exception here
+                LocalEndPoint = socket.LocalEndPoint;
+            }
+            catch
+            {
+            }
 #endif
 
-            HostName = GetHostOfEndPoint(socket.RemoteEndPoint);
-
+            if (e.RemoteEndPoint != null)
+            {
+                HostName = GetHostOfEndPoint(e.RemoteEndPoint);
+            }
+            else
+            {
+                try
+                {
+                    HostName = GetHostOfEndPoint(socket.RemoteEndPoint);
+                }
+                catch
+                {
+                }
+            }
 
 #if !SILVERLIGHT && !NETFX_CORE
             try
@@ -251,8 +268,7 @@ namespace SuperSocket.ClientEngine
             {
                 try
                 {
-#if NETFX_CORE
-                    client.Shutdown(SocketShutdown.Both);                    
+#if NETFX_CORE                  
                     client.Dispose();
 #else
                     client.Close();

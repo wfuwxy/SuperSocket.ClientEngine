@@ -9,7 +9,7 @@ using System.Threading;
 
 namespace SuperSocket.ClientEngine
 {
-    public abstract class EasyClientBase : IBufferState
+    public abstract class EasyClientBase
     {
         private IClientSession m_Session;
         private TaskCompletionSource<bool> m_ConnectTaskSource;
@@ -18,13 +18,29 @@ namespace SuperSocket.ClientEngine
 
         protected IPipelineProcessor PipeLineProcessor { get; set; }
 
-#if !NETFX_CORE
+#if !NETFX_CORE || NETSTANDARD
         public SecurityOption Security { get; set; }
 #endif
 
 #if !SILVERLIGHT
 
-        public EndPoint LocalEndPoint { get; set; }
+        private EndPoint m_EndPointToBind;
+        private EndPoint m_LocalEndPoint;
+
+        public EndPoint LocalEndPoint
+        {
+            get
+            {
+                if (m_LocalEndPoint != null)
+                    return m_LocalEndPoint;
+                    
+                return m_EndPointToBind;
+            }
+            set
+            {
+                m_EndPointToBind = value;
+            }
+        }
 #endif
 
 #if !__IOS__
@@ -32,6 +48,8 @@ namespace SuperSocket.ClientEngine
 #endif
 
         public int ReceiveBufferSize { get; set; }
+
+        public IProxyConnector Proxy { get; set; }
 
         public EasyClientBase()
         {
@@ -48,8 +66,8 @@ namespace SuperSocket.ClientEngine
             if (PipeLineProcessor == null)
                 throw new Exception("This client has not been initialized.");
 
-            m_ConnectTaskSource = InitConnect(remoteEndPoint);
-            return await m_ConnectTaskSource.Task;
+            var connectTaskSrc = m_ConnectTaskSource = InitConnect(remoteEndPoint);
+            return await connectTaskSrc.Task.ConfigureAwait(false);
         }
 #else
         public Task<bool> ConnectAsync(EndPoint remoteEndPoint)
@@ -57,14 +75,14 @@ namespace SuperSocket.ClientEngine
             if (PipeLineProcessor == null)
                 throw new Exception("This client has not been initialized.");
 
-            m_ConnectTaskSource = InitConnect(remoteEndPoint);
-            return m_ConnectTaskSource.Task;
+            var connectTaskSrc = InitConnect(remoteEndPoint);
+            return connectTaskSrc.Task;
         }
 #endif
 
         private TcpClientSession GetUnderlyingSession()
         {
-#if NETFX_CORE
+#if NETFX_CORE && !NETSTANDARD
             return new AsyncTcpSession();
 #else
             var security = Security;
@@ -102,49 +120,78 @@ namespace SuperSocket.ClientEngine
             var session = GetUnderlyingSession();
 
 #if !SILVERLIGHT
-            var localEndPoint = LocalEndPoint;
+            var localEndPoint = m_EndPointToBind;
 
             if (localEndPoint != null)
             {
-                session.LocalEndPoint = localEndPoint;
+                session.LocalEndPoint = m_EndPointToBind;
             }
 #endif
 
 #if !__IOS__
             session.NoDelay = NoDelay;
 #endif
-
-            session.Connected += new EventHandler(m_Session_Connected);
-            session.Error += new EventHandler<ErrorEventArgs>(m_Session_Error);
-            session.Closed += new EventHandler(m_Session_Closed);
-            session.DataReceived += new EventHandler<DataEventArgs>(m_Session_DataReceived);
+            if (Proxy != null)
+                session.Proxy = Proxy;
+                
+            session.Connected += new EventHandler(OnSessionConnected);
+            session.Error += new EventHandler<ErrorEventArgs>(OnSessionError);
+            session.Closed += new EventHandler(OnSessionClosed);
+            session.DataReceived += new EventHandler<DataEventArgs>(OnSessionDataReceived);
 
             if (ReceiveBufferSize > 0)
                 session.ReceiveBufferSize = ReceiveBufferSize;
 
             m_Session = session;
+            
+            var taskSrc = m_ConnectTaskSource = new TaskCompletionSource<bool>();
 
             session.Connect(remoteEndPoint);
             
-            return new TaskCompletionSource<bool>();
+            return taskSrc;
+        }
+        
+        public void Send(byte[] data)
+        {
+            Send(new ArraySegment<byte>(data, 0, data.Length));
         }
 
         public void Send(ArraySegment<byte> segment)
         {
-            if(!m_Connected || m_Session == null)
+            var session = m_Session;
+            
+            if(!m_Connected || session == null)
                 throw new Exception("The socket is not connected.");
 
-            m_Session.Send(segment);
+            session.Send(segment);
         }
 
         public void Send(List<ArraySegment<byte>> segments)
         {
-            if(!m_Connected || m_Session == null)
+            var session = m_Session;
+            
+            if(!m_Connected || session == null)
                 throw new Exception("The socket is not connected.");
 
-            m_Session.Send(segments);
+            session.Send(segments);
         }
 
+#if AWAIT
+        public async Task<bool> Close()
+        {
+            var session = m_Session;
+            
+            if(session != null && m_Connected)
+            {
+                var closeTaskSrc = new TaskCompletionSource<bool>();
+                m_CloseTaskSource = closeTaskSrc;
+                session.Close();
+                return await closeTaskSrc.Task.ConfigureAwait(false);
+            }
+
+            return await Task.FromResult(false);
+        }
+ #else
         public Task<bool> Close()
         {
             var session = m_Session;
@@ -152,21 +199,27 @@ namespace SuperSocket.ClientEngine
             if(session != null && m_Connected)
             {
                 var closeTaskSrc = new TaskCompletionSource<bool>();
-                session.Close();
                 m_CloseTaskSource = closeTaskSrc;
+                session.Close();
                 return closeTaskSrc.Task;
             }
 
-            return null;
+            return new Task<bool>(() => false);
         }
+ #endif
 
-        void m_Session_DataReceived(object sender, DataEventArgs e)
+        void OnSessionDataReceived(object sender, DataEventArgs e)
         {
-            var result = PipeLineProcessor.Process(new ArraySegment<byte>(e.Data, e.Offset, e.Length), this as IBufferState);
+            var result = PipeLineProcessor.Process(new ArraySegment<byte>(e.Data, e.Offset, e.Length));
 
-            // allocate new receive buffer if the previous one was cached
-            if (result.State == ProcessState.Cached)
+            if (result.State == ProcessState.Error)
             {
+                m_Session.Close();
+                return;
+            }
+            else if (result.State == ProcessState.Cached)
+            {
+                // allocate new receive buffer if the previous one was cached
                 var session = m_Session;
 
                 if (session != null)
@@ -179,9 +232,17 @@ namespace SuperSocket.ClientEngine
                     }
                 }
             }
+
+            if (result.Packages != null && result.Packages.Count > 0)
+            {
+                foreach (var item in result.Packages)
+                {
+                    HandlePackage(item);
+                }
+            }
         }
 
-        void m_Session_Error(object sender, ErrorEventArgs e)
+        void OnSessionError(object sender, ErrorEventArgs e)
         {
             if (!m_Connected)
             {
@@ -222,7 +283,7 @@ namespace SuperSocket.ClientEngine
 
         public event EventHandler<ErrorEventArgs> Error;
 
-        void m_Session_Closed(object sender, EventArgs e)
+        void OnSessionClosed(object sender, EventArgs e)
         {
             m_Connected = false;
 
@@ -231,16 +292,24 @@ namespace SuperSocket.ClientEngine
             if (handler != null)
                 handler(this, EventArgs.Empty);
 
-            if(m_CloseTaskSource != null)
+#if !SILVERLIGHT
+            m_LocalEndPoint = null;
+#endif
+
+            var closeTaskSrc = m_CloseTaskSource;
+            
+            if(closeTaskSrc != null)
             {
-                m_CloseTaskSource.SetResult(true);
-                m_CloseTaskSource = null;
+                if(Interlocked.CompareExchange(ref m_CloseTaskSource, null, closeTaskSrc) == closeTaskSrc)
+                {
+                    closeTaskSrc.SetResult(true);
+                }
             }
         }
 
         public event EventHandler Closed;
 
-        void m_Session_Connected(object sender, EventArgs e)
+        void OnSessionConnected(object sender, EventArgs e)
         {
             m_Connected = true;
 
@@ -248,7 +317,7 @@ namespace SuperSocket.ClientEngine
             TcpClientSession session = sender as TcpClientSession;
             if (session != null)
             {
-                LocalEndPoint = session.LocalEndPoint;
+                m_LocalEndPoint = session.LocalEndPoint;
             }
 #endif
 
@@ -263,14 +332,6 @@ namespace SuperSocket.ClientEngine
 
         public event EventHandler Connected;
 
-        int IBufferState.DecreaseReference()
-        {
-            return 0;
-        }
-
-        void IBufferState.IncreaseReference()
-        {
-
-        }
+        protected abstract void HandlePackage(IPackageInfo package);
     }
 }
